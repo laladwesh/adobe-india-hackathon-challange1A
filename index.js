@@ -1,168 +1,115 @@
-// This script is the final, submittable solution for the hackathon.
-// It reads PDFs from an /input folder and writes JSON to an /output folder.
-
 const fs = require('fs').promises;
 const path = require('path');
-// Use the Node.js distribution of pdf.js
-const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+const pdfjs = require('pdfjs-dist/legacy/build/pdf.js');
 
 const INPUT_DIR = '/app/input';
 const OUTPUT_DIR = '/app/output';
 
-/**
- * Helper function to process a line of text fragments from the PDF.
- * It merges text, determines font size, and checks for bold weight.
- */
-const processLine = (lineItems) => {
-    if (!lineItems || lineItems.length === 0) return { text: null, size: null, weight: null };
-    // Clean instructional text like "(Title...)" and join fragments.
-    const text = lineItems.map(item => item.str).join(' ').trim().replace(/\s*\(.*?\)\s*/g, '').trim();
-    if (!text) return { text: null, size: null, weight: null };
+function normalizeLine(items = []) {
+  if (!items.length) return null;
+  const text = items
+    .map(i => i.str)
+    .join(' ')
+    .replace(/\s*\(.*?\)\s*/g, '')
+    .trim();
+  if (!text) return null;
+  const { transform, fontName = '' } = items[0];
+  const size = parseFloat(transform[3].toFixed(2));
+  const weight = /bold/i.test(fontName) ? 'bold' : 'normal';
+  return { text, size, weight };
+}
 
-    const size = parseFloat(lineItems[0].transform[3].toFixed(2));
-    const fontName = lineItems[0].fontName || '';
-    // Check if the font name includes "bold" (case-insensitive).
-    const weight = /bold/i.test(fontName) ? "bold" : "normal";
-    return { text, size, weight };
-};
-
-/**
- * The core logic to extract the document outline.
- * This is the same logic from your final React component.
- */
 async function extractOutline(pdf) {
-    const yTolerance = 5; // How close in y-coordinate for text to be on the same line.
-    const lines = [];
+  const yThreshold = 5;
+  const rawLines = [];
 
-    for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const textContent = await page.getTextContent();
-        if (textContent.items.length === 0) continue;
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const { items } = await page.getTextContent();
+    if (!items.length) continue;
 
-        // Sort items by their vertical then horizontal position.
-        const sortedItems = textContent.items.sort((a, b) => {
-            const y1 = a.transform[5];
-            const y2 = b.transform[5];
-            if (Math.abs(y1 - y2) > yTolerance) return y2 - y1;
-            return a.transform[4] - b.transform[4];
-        });
+    items.sort((a, b) => {
+      const dy = b.transform[5] - a.transform[5];
+      if (Math.abs(dy) > yThreshold) return dy;
+      return a.transform[4] - b.transform[4];
+    });
 
-        if (sortedItems.length === 0) continue;
-
-        // Group text items into lines.
-        let currentLineItems = [sortedItems[0]];
-        for (let j = 1; j < sortedItems.length; j++) {
-            const prevItem = sortedItems[j - 1];
-            const currentItem = sortedItems[j];
-            if (Math.abs(prevItem.transform[5] - currentItem.transform[5]) <= yTolerance) {
-                currentLineItems.push(currentItem);
-            } else {
-                const { text, size, weight } = processLine(currentLineItems);
-                if (text) lines.push({ text, size, weight, page: i });
-                currentLineItems = [currentItem];
-            }
-        }
-        const { text, size, weight } = processLine(currentLineItems);
-        if (text) lines.push({ text, size, weight, page: i });
+    let lineGroup = [items[0]];
+    for (let i = 1; i < items.length; i++) {
+      const prevY = lineGroup[lineGroup.length - 1].transform[5];
+      const currY = items[i].transform[5];
+      if (Math.abs(prevY - currY) <= yThreshold) {
+        lineGroup.push(items[i]);
+      } else {
+        const line = normalizeLine(lineGroup);
+        if (line) rawLines.push({ ...line, page: pageNum });
+        lineGroup = [items[i]];
+      }
     }
-    
-    // Filter out any remaining empty or page number lines.
-    const cleanedLines = lines.filter(line => line.text && line.text.toLowerCase() !== `page ${line.page}`);
-    if (cleanedLines.length === 0) {
-        return { title: "Untitled Document", outline: [] };
-    }
+    const lastLine = normalizeLine(lineGroup);
+    if (lastLine) rawLines.push({ ...lastLine, page: pageNum });
+  }
 
-    // --- START OF TITLE FIX ---
+  const lines = rawLines.filter(l => l.text.toLowerCase() !== `page ${l.page}`);
+  if (!lines.length) return { title: 'Untitled Document', outline: [] };
 
-    // Step 1: Intelligently identify the title from the first page.
-    let title = "Untitled Document";
-    const firstPageLines = cleanedLines.filter(l => l.page === 1);
-    let titleSize = 0;
+  const page1 = lines.filter(l => l.page === 1);
+  const maxFont = Math.max(...page1.map(l => l.size));
+  const title =
+    page1.filter(l => l.size === maxFont).map(l => l.text).join(' ') ||
+    'Untitled Document';
 
-    if (firstPageLines.length > 0) {
-        // Find the largest font size that appears on the first page.
-        titleSize = Math.max(...firstPageLines.map(l => l.size));
-        
-        // Collect all lines on the first page that have this size and join them.
-        const titleLines = firstPageLines
-            .filter(l => l.size === titleSize)
-            .map(l => l.text);
-            
-        if (titleLines.length > 0) {
-            title = titleLines.join(' ');
-        }
-    }
+  const sizes = Array.from(new Set(lines.map(l => l.size)))
+    .sort((a, b) => b - a)
+    .filter(s => s !== maxFont);
 
-    // Step 2: Determine heading levels, excluding the title's font size.
-    const uniqueSizes = [...new Set(cleanedLines.map(l => l.size))].sort((a, b) => b - a);
-    const sizeToLevel = {};
-    
-    // Filter out the title's font size before assigning H1, H2, H3.
-    const remainingSizes = uniqueSizes.filter(s => s !== titleSize);
-    
-    if (remainingSizes.length > 0) sizeToLevel[remainingSizes[0]] = "H1";
-    if (remainingSizes.length > 1) sizeToLevel[remainingSizes[1]] = "H2";
-    if (remainingSizes.length > 2) sizeToLevel[remainingSizes[2]] = "H3";
+  const sizeToTag = {};
+  if (sizes[0]) sizeToTag[sizes[0]] = 'H1';
+  if (sizes[1]) sizeToTag[sizes[1]] = 'H2';
+  if (sizes[2]) sizeToTag[sizes[2]] = 'H3';
 
-    // Step 3: Build the final outline, ensuring title text is not included.
-    const finalOutline = [];
-    for (const line of cleanedLines) {
-        const level = sizeToLevel[line.size];
-        // Add to outline only if it's a heading and its text isn't part of the title.
-        if (level && !title.includes(line.text)) {
-            finalOutline.push({ level, text: line.text, page: line.page });
-        }
-    }
-    
-    return { title, outline: finalOutline };
-    // --- END OF TITLE FIX ---
+  const outline = lines
+    .filter(l => sizeToTag[l.size] && !title.includes(l.text))
+    .map(l => ({ level: sizeToTag[l.size], text: l.text, page: l.page }));
+
+  return { title, outline };
 }
 
-/**
- * Main function to run the extraction process.
- */
 async function main() {
-    console.log('Starting PDF structure extraction...');
+  console.log('Starting extraction...');
+  await fs.mkdir(OUTPUT_DIR, { recursive: true });
+
+  const allFiles = await fs.readdir(INPUT_DIR);
+  const pdfFiles = allFiles.filter(f => f.toLowerCase().endsWith('.pdf'));
+
+  if (!pdfFiles.length) {
+    console.log('No PDFs found in input.');
+    return;
+  }
+
+  for (const file of pdfFiles) {
+    console.log(`→ ${file}`);
+    const inPath = path.join(INPUT_DIR, file);
+    const outName = path.basename(file, '.pdf') + '.json';
+    const outPath = path.join(OUTPUT_DIR, outName);
+
     try {
-        // Ensure the output directory exists.
-        await fs.mkdir(OUTPUT_DIR, { recursive: true });
-
-        const files = await fs.readdir(INPUT_DIR);
-        const pdfFiles = files.filter(file => path.extname(file).toLowerCase() === '.pdf');
-
-        if (pdfFiles.length === 0) {
-            console.log('No PDF files found in the input directory.');
-            return;
-        }
-
-        for (const pdfFile of pdfFiles) {
-            const inputPath = path.join(INPUT_DIR, pdfFile);
-            const outputFileName = `${path.parse(pdfFile).name}.json`;
-            const outputPath = path.join(OUTPUT_DIR, outputFileName);
-            
-            console.log(`Processing ${pdfFile}...`);
-
-            try {
-                const data = await fs.readFile(inputPath);
-                const typedarray = new Uint8Array(data);
-                const pdf = await pdfjsLib.getDocument(typedarray).promise;
-                const result = await extractOutline(pdf);
-                
-                // Write the JSON output to the output directory.
-                await fs.writeFile(outputPath, JSON.stringify(result, null, 2));
-                console.log(`Successfully created ${outputFileName}`);
-            } catch (err) {
-                console.error(`Failed to process ${pdfFile}:`, err.message);
-                // Create a fallback JSON on error.
-                const errorResult = { title: `Error processing ${pdfFile}`, outline: [] };
-                await fs.writeFile(outputPath, JSON.stringify(errorResult, null, 2));
-            }
-        }
-    } catch (error) {
-        console.error('An error occurred in the main process:', error);
+      const data = await fs.readFile(inPath);
+      const uint8 = new Uint8Array(data);
+      const pdf = await pdfjs.getDocument(uint8).promise;
+      const result = await extractOutline(pdf);
+      await fs.writeFile(outPath, JSON.stringify(result, null, 2));
+      console.log(`   ✔ ${outName}`);
+    } catch (err) {
+      console.error(`   ✖ failed: ${err.message}`);
+      await fs.writeFile(
+        outPath,
+        JSON.stringify({ title: `Error: ${file}`, outline: [] }, null, 2)
+      );
     }
-    console.log('Extraction process finished.');
+  }
+
+  console.log('Done.');
 }
 
-// Run the main function.
-main();
+main().catch(err => console.error(err));

@@ -1,0 +1,14 @@
+{
+  "name": "adobe-hackathon-submission",
+  "version": "1.0.0",
+  "description": "PDF Structure Extractor for Adobe Hackathon Round 1A.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "pdfjs-dist": "2.16.105"
+  }
+}
